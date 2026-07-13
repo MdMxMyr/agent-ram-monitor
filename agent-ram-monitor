@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+"""agent-ram-monitor: show running Claude Code / Codex / Copilot CLI sessions,
+their memory/CPU usage (whole process tree), a title for each session,
+and how to kill + resume each one.
+
+Usage:
+  agent-ram-monitor                    one-shot table
+  agent-ram-monitor -w [SECS]          refresh continuously (default 3s)
+  agent-ram-monitor --min-gb 2         only show sessions using >= 2 GB
+  agent-ram-monitor --json             machine-readable output
+  agent-ram-monitor --log              also record the scan to ~/.agent-ram-monitor/history.jsonl
+  agent-ram-monitor blame [--since 4h] attribute RAM growth from recorded history
+
+Session IDs read from process argv are exact; IDs inferred by matching
+session-file creation time to process start time are marked with '~'.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+IMAGE_TOKEN_RE = re.compile(r"^\s*(\[Image #\d+\]\s*)+")
+MATCH_TOLERANCE = 15 * 60  # max |file birth - proc start| for a time-based match
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          errors="replace").stdout
+
+
+def parse_etime(etime):
+    """ps etime '[[dd-]hh:]mm:ss' -> seconds."""
+    days = 0
+    if "-" in etime:
+        d, etime = etime.split("-", 1)
+        days = int(d)
+    parts = [int(p) for p in etime.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, s = parts
+    return days * 86400 + h * 3600 + m * 60 + s
+
+
+def list_processes():
+    procs = {}
+    out = run(["ps", "-axo", "pid=,ppid=,rss=,%cpu=,etime=,tty=,args="])
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\S+)\s+(\S+)\s+(.*)", line)
+        if not m:
+            continue
+        pid, ppid, rss, cpu, etime, tty, args = m.groups()
+        procs[int(pid)] = {
+            "pid": int(pid), "ppid": int(ppid), "rss_kb": int(rss),
+            "cpu": float(cpu), "uptime_s": parse_etime(etime),
+            "tty": tty if tty != "??" else "-", "args": args,
+        }
+    return procs
+
+
+def classify(args):
+    """Return tool name if this command is an agent CLI root, else None."""
+    argv = args.split()
+    if not argv:
+        return None
+    exe = argv[0]
+    if "/Applications/" in exe or ".app/" in exe:
+        return None  # desktop apps (Claude.app, Codex.app), not CLI sessions
+    base = os.path.basename(exe)
+    if base == "claude":
+        return "claude"
+    if base == "codex":
+        return "codex (app-server)" if "app-server" in argv[1:2] else "codex"
+    if base == "copilot":
+        return "copilot"
+    # `node .../bin/claude` style invocations
+    if base in ("node", "bun") and len(argv) > 1:
+        sub = os.path.basename(argv[1])
+        if sub in ("claude", "codex", "copilot"):
+            return sub
+    return None
+
+
+def tree_rss(root_pid, procs, children):
+    """Sum RSS of a process and all descendants; return (kb, pids)."""
+    total, stack, seen = 0, [root_pid], []
+    while stack:
+        pid = stack.pop()
+        if pid in seen or pid not in procs:
+            continue
+        seen.append(pid)
+        total += procs[pid]["rss_kb"]
+        stack.extend(children.get(pid, []))
+    return total, seen
+
+
+MUX_BINARIES = {"tmux": "tmux", "zellij": "zellij", "screen": "screen", "sshd": "ssh"}
+
+
+def host_app(pid, procs):
+    """Walk up the process tree to find the app hosting this session:
+    first .app-bundle ancestor (Terminal, c11, cmux, iTerm2, Cursor, ...)
+    or a terminal multiplexer binary."""
+    seen = set()
+    pid = procs.get(pid, {}).get("ppid")
+    while pid in procs and pid not in seen and pid != 1:
+        seen.add(pid)
+        argv0 = (procs[pid]["args"].split() or [""])[0]
+        if m := re.search(r"/([^/]+)\.app/", argv0):
+            return m.group(1)
+        if name := MUX_BINARIES.get(os.path.basename(argv0)):
+            return name
+        pid = procs[pid]["ppid"]
+    return None
+
+
+def get_cwds(pids):
+    """Batch-resolve cwd for pids via lsof."""
+    if not pids:
+        return {}
+    out = run(["lsof", "-a", "-d", "cwd", "-Fn", "-p", ",".join(map(str, pids))])
+    cwds, pid = {}, None
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwds[pid] = line[1:]
+    return cwds
+
+
+def birthtime(path):
+    try:
+        st = os.stat(path)
+        return getattr(st, "st_birthtime", st.st_mtime)
+    except OSError:
+        return None
+
+
+def clean(text, limit=120):
+    text = IMAGE_TOKEN_RE.sub("", text)
+    text = re.sub(r"\\0\d\d", " ", text)  # ps renders control chars as \012 etc.
+    return re.sub(r"\s+", " ", text).strip()[:limit] or None
+
+
+def assign_by_time(needs, candidates):
+    """Greedy 1:1 matching of processes to session files by
+    |file birthtime - process start|. needs: [(key, start_ts)];
+    candidates: [(birth_ts, value)]. Returns {key: value}."""
+    pairs = sorted(
+        (abs(birth - start), key, value)
+        for key, start in needs for birth, value in candidates
+        if abs(birth - start) <= MATCH_TOLERANCE
+    )
+    out, used = {}, set()
+    for _, key, value in pairs:
+        if key in out or id(value) in used:
+            continue
+        out[key] = value
+        used.add(id(value))
+    return out
+
+
+# ---------- c11 (terminal multiplexer) live tab titles ----------
+
+SPINNER_RE = re.compile(r"^[⠀-⣿✳✶✻✽✢·*]+\s*")
+
+# Resolve c11 outside a c11 shell (e.g. under launchd, where PATH is bare
+# and CMUX_SOCKET_PATH is unset — without it the CLI looks for a legacy
+# cmux.sock and fails).
+C11_BIN = shutil.which("c11") or "/Applications/c11.app/Contents/Resources/bin/c11"
+_c11_env = None
+
+
+def c11_run(args):
+    global _c11_env
+    if _c11_env is None:
+        _c11_env = dict(os.environ)
+        if "CMUX_SOCKET_PATH" not in _c11_env:
+            for sock in (f"{HOME}/Library/Application Support/c11/c11.sock",
+                         f"{HOME}/Library/Application Support/cmux/cmux.sock"):
+                if os.path.exists(sock):
+                    _c11_env["CMUX_SOCKET_PATH"] = sock
+                    break
+    return subprocess.run([C11_BIN] + args, capture_output=True, text=True,
+                          env=_c11_env).stdout
+
+
+def c11_titles():
+    """Map claude session_id -> (live tab title, workspace uuid). Primary
+    source: c11's continuously-rewritten session state file (plain JSON on
+    disk — works from any context, one read). Fallback: the c11 socket,
+    which only answers descendants of the c11 app, so it fails under
+    launchd."""
+    state = c11_titles_from_state()
+    return state or {sid: (t, None, None) for sid, t in c11_titles_from_socket().items()}
+
+
+def c11_titles_from_state():
+    info = {}
+    files = (glob.glob(f"{HOME}/Library/Application Support/c11/session-*.json")
+             + glob.glob(f"{HOME}/Library/Application Support/cmux/session-*.json"))
+    fresh = sorted(f for f in files
+                   if time.time() - (os.path.getmtime(f) if os.path.exists(f) else 0) < 600)
+
+    def walk(node, workspace):
+        if isinstance(node, dict):
+            if "focusedPanelId" in node and node.get("id"):
+                workspace = node["id"]  # entering a workspace subtree
+            meta = node.get("metadata") or {}
+            sid = meta.get("claude.session_id")
+            if sid:
+                raw = node.get("customTitle") or node.get("title") or meta.get("title")
+                if raw and (cleaned := clean(SPINNER_RE.sub("", raw))):
+                    info[sid] = (cleaned, workspace, node.get("id"))
+            for v in node.values():
+                walk(v, workspace)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, workspace)
+
+    for f in fresh:
+        try:
+            walk(json.load(open(f)), None)
+        except (OSError, ValueError):
+            continue
+    return info
+
+
+def c11_titles_from_socket():
+    if not os.path.exists(C11_BIN):
+        return {}
+    try:
+        tree = json.loads(c11_run(["tree", "--all", "--json"]))
+    except (ValueError, OSError):
+        return {}
+    terminals = []
+
+    def walk(node, ws=None):
+        if isinstance(node, dict):
+            ref = str(node.get("ref", ""))
+            if ref.startswith("workspace:"):
+                ws = ref
+            if ref.startswith("surface:") and node.get("type") == "terminal":
+                terminals.append((ws, ref))
+            for v in node.values():
+                walk(v, ws)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, ws)
+
+    walk(tree)
+
+    def fetch(ws_surf):
+        ws, surf = ws_surf
+        return dict(m.groups() for m in re.finditer(
+            r"^(\S+) = (.*)$",
+            c11_run(["get-metadata", "--workspace", ws, "--surface", surf]),
+            re.M))
+
+    from concurrent.futures import ThreadPoolExecutor
+    titles = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for meta in pool.map(fetch, terminals):
+            sid, title = meta.get("claude.session_id"), meta.get("title", "").strip()
+            if sid and title:
+                cleaned = clean(SPINNER_RE.sub("", title))
+                if cleaned:
+                    titles[sid] = cleaned
+    return titles
+
+
+# ---------- claude ----------
+
+def claude_proj_dir(cwd):
+    return f"{HOME}/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def claude_argv_id(proc):
+    m = re.search(r"--(?:session-id|resume)[= ](\S+)", proc["args"])
+    return m.group(1) if m and UUID_RE.fullmatch(m.group(1)) else None
+
+
+def claude_title(proj_dir, session_id):
+    """Title = firstPrompt from sessions-index.json, else first real user
+    message in the session jsonl (the index lags behind live sessions)."""
+    try:
+        idx = json.load(open(f"{proj_dir}/sessions-index.json"))
+        for e in idx.get("entries", []):
+            if e.get("sessionId") == session_id:
+                fp = e.get("firstPrompt")
+                if fp and fp != "No prompt":
+                    return clean(fp)
+    except (OSError, ValueError):
+        pass
+    fallback = None
+    try:
+        with open(f"{proj_dir}/{session_id}.jsonl") as fh:
+            for line in fh:
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") != "user" or obj.get("isMeta"):
+                    continue
+                content = obj.get("message", {}).get("content")
+                if isinstance(content, list):
+                    content = next((c.get("text") for c in content
+                                    if c.get("type") == "text"), None)
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                if not content.lstrip().startswith(("<", "Caveat:")):
+                    return clean(content)  # first plain-text prompt wins
+                if fallback is None:
+                    if m := re.search(r"<command-name>(.*?)</command-name>"
+                                      r"(?:.*?<command-args>(.*?)</command-args>)?",
+                                      content, re.S):
+                        fallback = f"{m.group(1)} {m.group(2) or ''}"
+                    elif m := re.search(r"<bash-input>(.*?)</bash-input>", content, re.S):
+                        fallback = f"! {m.group(1)}"
+    except OSError:
+        pass
+    return clean(fallback) if fallback else None
+
+
+def claude_pidfile(pid, start_ts):
+    """~/.claude/sessions/<pid>.json: exact pid -> session mapping written
+    by recent Claude Code versions, plus live status (busy/idle/...).
+    Rejected when the recorded start time disagrees with the live process —
+    a stale file left behind by a recycled pid must not relabel the new
+    process with the old session."""
+    try:
+        d = json.load(open(f"{HOME}/.claude/sessions/{pid}.json"))
+    except (OSError, ValueError):
+        return {}
+    if d.get("pid") != pid:
+        return {}
+    # A recycled pid's stale file has a start time far from the live process;
+    # the tolerance is generous enough to absorb clock skew / measurement
+    # noise between JS `startedAt` and the ps-derived start, so a legitimate
+    # slow-launched session isn't wrongly stripped of its state.
+    started_at = d.get("startedAt")
+    if isinstance(started_at, (int, float)) and abs(started_at / 1000 - start_ts) > 600:
+        return {}
+    return d
+
+
+def resolve_claude(rows, claimed_ids):
+    """Fill session/state/title for claude rows. Pid-file and argv IDs are
+    exact; the rest are matched per project dir by file-creation vs
+    process-start time, so many sessions in the same dir pair up 1:1
+    instead of 'newest wins'."""
+    unresolved = {}
+    for row in rows:
+        info = claude_pidfile(row["pid"], row["_start"])
+        sid = info.get("sessionId") or claude_argv_id(row["_proc"])
+        row["state"] = info.get("status")
+        row["cwd"] = row["cwd"] or info.get("cwd")
+        if sid:
+            row["session"], row["match"] = sid, "exact"
+            claimed_ids.add(sid)
+        elif row["cwd"]:
+            unresolved.setdefault(claude_proj_dir(row["cwd"]), []).append(row)
+
+    for proj_dir, group in unresolved.items():
+        candidates = []
+        for f in glob.glob(f"{proj_dir}/*.jsonl"):
+            sid = os.path.splitext(os.path.basename(f))[0]
+            if not UUID_RE.fullmatch(sid) or sid in claimed_ids:
+                continue
+            b = birthtime(f)
+            if b:
+                candidates.append((b, sid))
+        needs = [(row["pid"], row["_start"]) for row in group]
+        matched = assign_by_time(needs, candidates)
+        for row in group:
+            if row["pid"] in matched:
+                row["session"], row["match"] = matched[row["pid"]], "time"
+
+    live = c11_titles() if rows else {}
+    for row in rows:
+        if row["session"]:
+            title, workspace, surface = live.get(row["session"]) or (None, None, None)
+            row["c11_workspace"] = workspace
+            row["c11_surface"] = surface
+            row["title"] = title or (
+                claude_title(claude_proj_dir(row["cwd"]), row["session"])
+                if row["cwd"] else None)
+
+
+# ---------- codex ----------
+
+def codex_meta(path):
+    try:
+        with open(path) as fh:
+            return json.loads(fh.readline()).get("payload", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def codex_title(path):
+    try:
+        with open(path) as fh:
+            for line in fh:
+                if '"user_message"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                p = obj.get("payload", {})
+                if p.get("type") == "user_message" and p.get("message"):
+                    return clean(p["message"])
+    except OSError:
+        pass
+    return None
+
+
+def resolve_codex(row, claimed_ids):
+    proc = row["_proc"]
+    m = re.search(r"\bresume\s+(\S+)", proc["args"])
+    if m and UUID_RE.fullmatch(m.group(1)):
+        row["session"], row["match"] = m.group(1), "argv"
+    else:
+        # rollout filenames embed the session start time (local tz)
+        candidates = []
+        for f in glob.glob(f"{HOME}/.codex/sessions/*/*/*/rollout-*.jsonl"):
+            fm = re.search(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"
+                           r"([0-9a-f-]{36})\.jsonl$", f)
+            if not fm or fm.group(2) in claimed_ids:
+                continue
+            ts = time.mktime(time.strptime(fm.group(1), "%Y-%m-%dT%H-%M-%S"))
+            if abs(ts - row["_start"]) > MATCH_TOLERANCE:
+                continue
+            meta = codex_meta(f)
+            if "subagent" in json.dumps(meta.get("source", "")) \
+                    or meta.get("thread_source") == "subagent":
+                continue
+            if row["cwd"] and meta.get("cwd") not in (None, row["cwd"]):
+                continue
+            candidates.append((abs(ts - row["_start"]), fm.group(2), f))
+        if candidates:
+            _, sid, path = min(candidates)
+            row["session"], row["match"], row["_file"] = sid, "time", path
+    if row["session"]:
+        claimed_ids.add(row["session"])  # no double assignment across rows
+    if row["session"] and not row.get("title"):
+        path = row.get("_file")
+        if not path:
+            hits = glob.glob(f"{HOME}/.codex/sessions/*/*/*/rollout-*-{row['session']}.jsonl")
+            path = hits[0] if hits else None
+        if path:
+            row["title"] = codex_title(path)
+
+
+# ---------- copilot ----------
+
+def copilot_workspace(sdir):
+    try:
+        text = open(f"{sdir}/workspace.yaml").read()
+    except OSError:
+        return {}
+    return {k: m.group(1).strip() for k, pat in
+            [("cwd", r"^cwd: (.*)$"), ("name", r"^name: (.*)$")]
+            if (m := re.search(pat, text, re.M))}
+
+
+def resolve_copilot(row, claimed_ids):
+    m = re.search(r"--resume[= ](\S+)", row["_proc"]["args"])
+    if m and UUID_RE.fullmatch(m.group(1)):
+        row["session"], row["match"] = m.group(1), "argv"
+    else:
+        candidates = []
+        for sdir in glob.glob(f"{HOME}/.copilot/session-state/*"):
+            sid = os.path.basename(sdir)
+            if sid in claimed_ids:
+                continue
+            ws = copilot_workspace(sdir)
+            if row["cwd"] and ws.get("cwd") != row["cwd"]:
+                continue
+            b = birthtime(f"{sdir}/events.jsonl") or birthtime(sdir)
+            if b and abs(b - row["_start"]) <= MATCH_TOLERANCE:
+                candidates.append((abs(b - row["_start"]), sid))
+        if candidates:
+            row["session"], row["match"] = min(candidates)[1], "time"
+    if row["session"]:
+        claimed_ids.add(row["session"])  # no double assignment across rows
+        ws = copilot_workspace(f"{HOME}/.copilot/session-state/{row['session']}")
+        row["title"] = ws.get("name")
+
+
+# ---------- child process breakdown (MCPs, browsers, nested agents) ----------
+
+def elide_path(token):
+    """Keep the informative tail of long absolute paths:
+    /Users/x/Projects/foo/node_modules/jest-worker/processChild.js
+    -> …/jest-worker/processChild.js"""
+    if token.startswith("/") and len(token) > 32:
+        parts = token.rstrip("/").split("/")
+        if len(parts) > 3:
+            return "…/" + "/".join(parts[-2:])
+    return token
+
+
+def child_label(args):
+    """Classify + label a descendant of an agent session. Returns
+    (kind, label) — kind: mcp|browser|agent|lsp|cmd, or None to skip."""
+    argv = args.split()
+    if not argv or argv[-1] == "<defunct>":
+        return None
+    if "shell-snapshots/snapshot-" in args:
+        return None  # Bash-tool zsh wrapper; its child is the real command
+    base = os.path.basename(argv[0])
+    if base in ("npm", "npx", "bunx"):
+        # `npm exec <pkg>` puts the package after "exec"; `npx <pkg>` /
+        # `bunx <pkg>` take it directly. Bare `npm run …` isn't a package
+        # launch — fall through to the generic label.
+        if argv[1:2] == ["exec"]:
+            rest = argv[2:]
+        elif base in ("npx", "bunx"):
+            rest = argv[1:]
+        else:
+            rest = []
+        if rest:
+            target = next((a for a in rest if not a.startswith("-")), "?")
+            target = re.sub(r"@(latest|[\d.]+)$", "", target)
+            return ("mcp" if "mcp" in target.lower() else "cmd"), target
+    lower = base.lower()
+    if "mcp" in lower:
+        return "mcp", base
+    if re.search(r"chrome|chromium|headless_shell|webkit|firefox", lower):
+        return "browser", base
+    if base in ("claude", "codex", "copilot"):
+        return "agent", " ".join([base] + argv[1:2])
+    if "lsp" in lower or base == "sourcekit-lsp":
+        return "lsp", base
+    tail = " ".join(elide_path(a) for a in argv[1:3])
+    return "cmd", clean(f"{base} {tail}", 60)
+
+
+def child_breakdown(root_pid, procs, children):
+    """Notable descendants of a session: every mcp/browser/agent/lsp, and
+    commands whose subtree uses real memory. Wrapper shells collapse, and
+    ≥3 sibling processes with the same label (worker pools: jest, vitest,
+    chrome renderers) roll up into one aggregate entry."""
+    out = []
+
+    def subtree_kb(pid):
+        return tree_rss(pid, procs, children)[0]
+
+    def visit(pid, depth, anc):
+        for c in sorted(children.get(pid, []), key=lambda c: -subtree_kb(c)):
+            if c not in procs:
+                continue
+            info = child_label(procs[c]["args"])
+            if info is None:
+                visit(c, depth, anc)  # collapse wrappers/zombies, keep their kids
+                continue
+            kind, label = info
+            out.append({"pid": c, "depth": depth, "kind": kind, "label": label,
+                        "ram_gb": subtree_kb(c) / 1024 / 1024,
+                        "own_gb": procs[c]["rss_kb"] / 1024 / 1024,
+                        "_parent": pid, "_anc": anc})
+            visit(c, depth + 1, anc + (c,))
+
+    visit(root_pid, 0, ())
+    return rollup_pools(out)
+
+
+def rollup_pools(entries, min_pool=3):
+    groups = {}
+    for e in entries:
+        groups.setdefault((e["_parent"], e["depth"], e["kind"], e["label"]), []).append(e)
+    drop, replace = set(), {}
+    for members in groups.values():
+        if len(members) < min_pool:
+            continue
+        first = members[0]
+        pool_pids = {m["pid"] for m in members}
+        agg = dict(first,
+                   label=f"{len(members)}× {first['label']}",
+                   ram_gb=sum(m["ram_gb"] for m in members),
+                   own_gb=sum(m["own_gb"] for m in members),
+                   count=len(members), pids=sorted(pool_pids))
+        replace[id(first)] = agg
+        drop.update(id(m) for m in members[1:])
+        # pool members' descendants are inside the aggregated subtree total
+        drop.update(id(e) for e in entries if set(e["_anc"]) & pool_pids)
+    result = []
+    for e in entries:
+        if id(e) in drop:
+            continue
+        e = replace.get(id(e), e)
+        e = {k: v for k, v in e.items() if not k.startswith("_")}
+        e.setdefault("count", 1)
+        e.setdefault("pids", [e["pid"]])
+        result.append(e)
+    return result
+
+
+def app_breakdown(procs, agent_pids, top=14):
+    """System-wide RAM grouped by app bundle (Chrome helpers -> 'Google
+    Chrome'), with agent-session processes excluded — they're reported as
+    one 'coding agents' entry so the totals reconcile with the sessions."""
+    groups = {}
+    for pid, p in procs.items():
+        if pid in agent_pids or p["rss_kb"] <= 0:
+            continue
+        if m := re.search(r"/([^/]+)\.app/", p["args"]):
+            name = m.group(1)
+        else:
+            name = os.path.basename((p["args"].split() or ["?"])[0]) or "?"
+        g = groups.setdefault(name, [0, 0])
+        g[0] += p["rss_kb"]
+        g[1] += 1
+    ranked = sorted(groups.items(), key=lambda kv: -kv[1][0])
+    out = [{"name": n, "ram_gb": kb / 1024 / 1024, "procs": count}
+           for n, (kb, count) in ranked[:top] if kb / 1024 / 1024 >= 0.05]
+    rest_kb = sum(kb for _, (kb, _) in ranked[top:])
+    if rest_kb / 1024 / 1024 >= 0.05:
+        out.append({"name": "everything else",
+                    "ram_gb": rest_kb / 1024 / 1024,
+                    "procs": sum(c for _, (_, c) in ranked[top:])})
+    return out
+
+
+# ---------- flight recorder + blame ----------
+
+HIST_FILE = os.environ.get("AGENT_RAM_MONITOR_HISTORY") or f"{HOME}/.agent-ram-monitor/history.jsonl"
+HIST_MAX_BYTES = 20 * 1024 * 1024
+
+
+def log_scan(sessions):
+    """Append a slim snapshot of this scan to the history ring buffer."""
+    rec = {"ts": int(time.time()), "sessions": [{
+        "session": s["session"], "pid": s["pid"], "tool": s["tool"],
+        "state": s["state"],
+        "project": os.path.basename(s["cwd"]) if s["cwd"] else None,
+        "title": (s["title"] or "")[:40] or None,
+        "ram_gb": round(s["ram_gb"], 3),
+        "children": [{"label": c["label"], "kind": c["kind"], "depth": c["depth"],
+                      "ram_gb": round(c["ram_gb"], 3)} for c in s["children"]],
+    } for s in sessions]}
+    try:
+        os.makedirs(os.path.dirname(HIST_FILE), exist_ok=True)
+        if os.path.exists(HIST_FILE) and os.path.getsize(HIST_FILE) > HIST_MAX_BYTES:
+            os.replace(HIST_FILE, HIST_FILE + ".1")
+        with open(HIST_FILE, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
+
+
+def downsample(vals, width):
+    if len(vals) <= width:
+        return vals
+    step = len(vals) / width
+    return [max(vals[int(i * step):max(int(i * step) + 1, int((i + 1) * step))])
+            for i in range(width)]
+
+
+def _tail_records(path, cutoff, max_bytes=1024 * 1024):
+    """Parse in-window records from the last max_bytes of a history file.
+    Bounded so the 10s poll doesn't re-read an ever-growing log."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    if size > max_bytes and lines:
+        lines = lines[1:]  # partial first line after the seek
+    recs = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("ts", 0) >= cutoff:
+            recs.append(r)
+    return recs
+
+
+def recent_ram_history(span_s=3600, buckets=24):
+    """session_id -> downsampled RAM series from the history tail, so the
+    menu bar app can draw ram-over-time sparklines."""
+    cutoff = time.time() - span_s
+    recs = _tail_records(HIST_FILE, cutoff)
+    # Just after a rotation the current file only holds a few minutes; pull
+    # the rest of the window from the .1 backup.
+    if (not recs or min(r["ts"] for r in recs) > cutoff) \
+            and os.path.exists(HIST_FILE + ".1"):
+        recs = _tail_records(HIST_FILE + ".1", cutoff) + recs
+    series = {}
+    for r in recs:
+        for s in r.get("sessions", []):
+            if s.get("session"):
+                series.setdefault(s["session"], []).append(s["ram_gb"])
+    return {k: downsample(v, buckets) for k, v in series.items() if len(v) >= 2}
+
+
+def parse_since(text):
+    m = re.fullmatch(r"(\d+)([smhd])", text)
+    if not m:
+        sys.exit(f"bad --since value {text!r} (use e.g. 90m, 4h, 2d)")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def load_history(cutoff):
+    recs = []
+    for path in (HIST_FILE + ".1", HIST_FILE):
+        try:
+            fh = open(path)
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if r.get("ts", 0) >= cutoff:
+                    recs.append(r)
+    recs.sort(key=lambda r: r["ts"])
+    return recs
+
+
+def sparkline(vals, width=24):
+    vals = downsample(vals, width)
+    lo, hi = min(vals), max(vals)
+    span = (hi - lo) or 1
+    return "".join("▁▂▃▄▅▆▇█"[min(7, int((v - lo) / span * 7.999))] for v in vals)
+
+
+def group_children(children):
+    """Aggregate top-level child subtrees by (kind, label) — pids churn
+    (MCP restarts, npm exec respawns), labels are the stable identity."""
+    out = {}
+    for c in children:
+        if c.get("depth", 0) == 0:
+            # strip pool counts ("13× node ...") so a pool that grows or
+            # shrinks between samples still matches itself
+            key = (c["kind"], re.sub(r"^\d+× ", "", c["label"]))
+            out[key] = out.get(key, 0) + c["ram_gb"]
+    return out
+
+
+def blame(prefix, since, min_growth=0.2):
+    recs = load_history(time.time() - parse_since(since))
+    series, meta = {}, {}
+    for r in recs:
+        for s in r["sessions"]:
+            key = s.get("session") or f"{s['tool']}:{s['pid']}"
+            if prefix and not key.startswith(prefix):
+                continue
+            series.setdefault(key, []).append((r["ts"], s["ram_gb"], s.get("children", [])))
+            meta[key] = s
+    reports = []
+    for key, samples in series.items():
+        if len(samples) < 2:
+            continue
+        # Largest climb anywhere in the window (max drawup with a rolling
+        # minimum) — not just the run-up to the global peak, which would
+        # miss a later, smaller-but-real second blowup.
+        rams = [x[1] for x in samples]
+        trough = peak = low = 0
+        growth = 0.0
+        for i, r in enumerate(rams):
+            if r < rams[low]:
+                low = i
+            if r - rams[low] > growth:
+                growth, trough, peak = r - rams[low], low, i
+        reports.append((growth, key, samples, trough, peak))
+    reports.sort(key=lambda r: -r[0])
+
+    shown = 0
+    for growth, key, samples, ti, pi in reports:
+        if growth < min_growth:
+            break  # reports are sorted desc; nothing below the floor is worth showing
+        s, rams = meta[key], [x[1] for x in samples]
+        t0 = datetime.fromtimestamp(samples[ti][0]).strftime("%a %H:%M")
+        t1 = datetime.fromtimestamp(samples[pi][0]).strftime("%H:%M")
+        ident = " · ".join(x for x in (s["tool"], s.get("project"), s.get("title")) if x)
+        print(f"{key[:8]}  {ident}")
+        print(f"   {sparkline(rams)}  now {rams[-1]:.2f}G")
+        print(f"   {rams[ti]:.2f}G → {rams[pi]:.2f}G between {t0} and {t1}  (+{growth:.2f}G)")
+        g0, g1 = group_children(samples[ti][2]), group_children(samples[pi][2])
+        child_total = 0.0
+        for delta, (kind, label) in sorted(
+                ((g1.get(k, 0) - g0.get(k, 0), k) for k in set(g0) | set(g1)), reverse=True):
+            child_total += delta
+            if abs(delta) >= 0.05:
+                print(f"     {delta:+.2f}G  {kind:<7} {label}")
+        own = growth - child_total
+        if abs(own) >= 0.05:
+            print(f"     {own:+.2f}G  (session process itself)")
+        print()
+        shown += 1
+        if not prefix and shown >= 10:
+            break
+    if not shown:
+        print(f"No session grew ≥{min_growth}G in the last {since} "
+              f"({len(recs)} samples on record).")
+
+
+# ---------- main ----------
+
+RESUME_CMD = {"claude": "claude --resume", "codex": "codex resume", "copilot": "copilot --resume"}
+
+
+def scan():
+    procs = list_processes()
+    children = {}
+    for p in procs.values():
+        children.setdefault(p["ppid"], []).append(p["pid"])
+
+    roots = {pid: tool for pid, p in procs.items() if (tool := classify(p["args"]))}
+    # drop roots nested under another agent root (already counted in parent's tree)
+    top = {}
+    for pid, tool in roots.items():
+        anc = procs[pid]["ppid"]
+        while anc in procs and anc not in roots:
+            anc = procs[anc]["ppid"]
+        if anc not in roots:
+            top[pid] = tool
+
+    cwds = get_cwds(list(top))
+    now = time.time()
+    rows, agent_pids = [], set()
+    for pid, tool in top.items():
+        proc = procs[pid]
+        rss_kb, tree_pids = tree_rss(pid, procs, children)
+        agent_pids.update(tree_pids)
+        rows.append({
+            "tool": tool, "pid": pid, "tty": proc["tty"], "cpu": proc["cpu"],
+            "ram_gb": rss_kb / 1024 / 1024, "procs": len(tree_pids),
+            "uptime_s": proc["uptime_s"], "cwd": cwds.get(pid),
+            "host": host_app(pid, procs),
+            "session": None, "title": None, "match": None, "state": None,
+            "children": child_breakdown(pid, procs, children),
+            "_proc": proc, "_start": now - proc["uptime_s"],
+        })
+
+    # IDs already claimed via argv can't belong to any other process
+    claimed = {claude_argv_id(r["_proc"]) for r in rows} - {None}
+
+    resolve_claude([r for r in rows if r["tool"] == "claude"], claimed)
+    for r in rows:
+        if r["tool"] == "codex":
+            resolve_codex(r, claimed)
+        elif r["tool"] == "copilot":
+            resolve_copilot(r, claimed)
+
+    history = recent_ram_history()
+    for r in rows:
+        base = r["tool"].split(" ")[0]
+        r["resume"] = (f"cd {shlex.quote(r['cwd'])} && {RESUME_CMD[base]} {r['session']}"
+                       if r["session"] and r["cwd"] and "(" not in r["tool"] else None)
+        r["ram_history"] = history.get(r["session"])
+        r.pop("_proc"), r.pop("_start"), r.pop("_file", None)
+
+    rows.sort(key=lambda s: -s["ram_gb"])
+    return rows, app_breakdown(procs, agent_pids)
+
+
+def fmt_uptime(s):
+    if s >= 86400:
+        return f"{s // 86400}d{s % 86400 // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{s % 3600 // 60}m"
+    return f"{s // 60}m"
+
+
+def render(sessions, min_gb, detail=False):
+    shown = [s for s in sessions if s["ram_gb"] >= min_gb]
+    total = sum(s["ram_gb"] for s in sessions)
+    rows = [("TOOL", "PID", "TTY", "RAM", "CPU%", "UP", "STATE", "HOST", "PROJECT", "SESSION", "TITLE")]
+    kids = []
+    for s in shown:
+        proj = os.path.basename(s["cwd"]) if s["cwd"] else "?"
+        sid = (s["session"] or "?")[:8] + ("~" if s["match"] == "time" else "")
+        rows.append((
+            s["tool"], str(s["pid"]), s["tty"], f"{s['ram_gb']:.2f}G",
+            f"{s['cpu']:.0f}", fmt_uptime(s["uptime_s"]), s["state"] or "-",
+            (s["host"] or "-")[:12], proj[:22], sid, (s["title"] or "")[:44],
+        ))
+        kids.append([c for c in s["children"]
+                     if detail or c["kind"] != "cmd" or c["ram_gb"] >= 0.1])
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    lines = [
+        "  ".join(c.ljust(w) for c, w in zip(rows[0], widths)).rstrip()]
+    for row, children in zip(rows[1:], kids):
+        lines.append("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip())
+        for c in children:
+            lines.append(f"{'   ' * c['depth']}   └─ {c['ram_gb']:.2f}G  "
+                         f"{c['kind']:<7} {c['label']}  [{c['pid']}]")
+    out = "\n".join(lines)
+    out += f"\n\n{len(sessions)} session(s), {total:.2f} GB total"
+    if min_gb and len(shown) < len(sessions):
+        out += f" ({len(sessions) - len(shown)} below {min_gb} GB hidden)"
+    resumable = [s for s in shown if s["resume"]]
+    if resumable:
+        out += "\n\nkill + resume:"
+        for s in resumable:
+            out += f"\n  [{s['ram_gb']:.1f}G] kill {s['pid']}  # then: {s['resume']}"
+    return out
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "blame":
+        bp = argparse.ArgumentParser(prog="agent-ram-monitor blame",
+                                     description="Attribute RAM growth using recorded history")
+        bp.add_argument("prefix", nargs="?", help="session-id prefix to focus on")
+        bp.add_argument("--since", default="12h", help="look-back window (e.g. 90m, 4h, 2d)")
+        b = bp.parse_args(sys.argv[2:])
+        blame(b.prefix, b.since)
+        return
+
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-w", "--watch", nargs="?", const=3, type=int, metavar="SECS")
+    ap.add_argument("--min-gb", type=float, default=0)
+    ap.add_argument("-d", "--detail", action="store_true",
+                    help="show all child processes, not just MCPs/browsers/big ones")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--log", action="store_true",
+                    help="append each scan to the history ring buffer (for `blame`)")
+    args = ap.parse_args()
+
+    while True:
+        sessions, apps = scan()
+        if args.log:
+            log_scan(sessions)
+        if args.json:
+            print(json.dumps({"sessions": sessions, "apps": apps}, indent=2))
+        else:
+            body = render(sessions, args.min_gb, args.detail)
+            if args.watch:
+                print(f"\033[2J\033[Hagent-ram-monitor  {datetime.now():%H:%M:%S}\n")
+            print(body)
+        if not args.watch:
+            break
+        try:
+            time.sleep(args.watch)
+        except KeyboardInterrupt:
+            break
+
+
+if __name__ == "__main__":
+    main()
